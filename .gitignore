@@ -1,0 +1,8 @@
+.azure
+.venv/
+__pycache__/
+*.pyc
+.env
+.DS_Store
+# ローカル検証で生成される Excel フィクスチャ（決定論的に再生成される）
+src/maf-foundry-agent/tests/sample_sales.xlsx

@@ -1,0 +1,9 @@
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+.env
+# ローカル検証専用。コンテナイメージには含めない。
+tests/

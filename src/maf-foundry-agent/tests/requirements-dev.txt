@@ -1,0 +1,4 @@
+# ローカル検証専用の依存（コンテナイメージには含めない）。
+# 任意のサンプルファイルを自前で用意して渡すため、fixture 生成用の pandas/openpyxl は不要。
+# ハーネス自体は requirements.txt のランタイム依存（agent-framework 系 / azure-identity /
+# python-dotenv）だけで動く。追加の dev 依存が必要になったらここに足す。

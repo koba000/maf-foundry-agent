@@ -1,0 +1,7 @@
+# Hosted-agent container の最小ランタイム依存（remote build はこれだけを install する）。
+# ローカル検証/開発専用の依存はここに入れない（tests/requirements-dev.txt 側へ）。
+agent-framework>=1.2.2
+agent-framework-foundry
+agent-framework-foundry-hosting
+azure-identity
+python-dotenv
