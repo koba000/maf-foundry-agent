@@ -1,7 +1,17 @@
 # Hosted-agent container の最小ランタイム依存（remote build はこれだけを install する）。
 # ローカル検証/開発専用の依存はここに入れない（tests/requirements-dev.txt 側へ）。
-agent-framework>=1.2.2
-agent-framework-foundry
-agent-framework-foundry-hosting
+# agent-framework 系はプレリリースで破壊的変更が入るため、ローカル検証（2026-05-31）で
+# green だった組み合わせに固定する。
+# 「agent-framework」本体は agent-framework-core[all]（Anthropic/Bedrock/Ollama等、未使用の
+# 大量オプション統合）を常に引き込みバージョン固定と噛み合わずpip解決が破綻するため、
+# 実際に import している agent_framework 名前空間を提供する agent-framework-core を
+# 拡張なしで直接指定する。
+agent-framework-core==1.7.0
+agent-framework-foundry==1.7.0
+agent-framework-foundry-hosting==1.0.0a260528
+# agent_framework_foundry_hosting が実行時に mcp を直接 import するが、パッケージの
+# 依存メタデータには宣言されていない（agent-framework-core 側の extra=="all" 経由でのみ
+# 入る想定になっている、パッケージ側の抜け漏れ）ため明示的に指定する。
+mcp==1.27.2
 azure-identity
 python-dotenv

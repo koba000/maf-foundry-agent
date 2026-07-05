@@ -3,7 +3,9 @@
 """ローカル検証 harness — 実エンドポイントに対する E2E。
 
 「ローカルで通ったもの＝デプロイされるもの」を満たすため、デプロイ入口と同じ
-create_agent() を import し、file_ids 経路で実ファイル分析まで確認する。
+create_agent() を import し、本番と同じ hosted_file 添付経路で実ファイル分析まで確認する:
+Files API にアップロード → Content.from_hosted_file(file_id) をメッセージに添付 →
+CodeInterpreterFileInjector middleware が file_ids を CI に注入する。
 
 固定の仮データは使わない。任意のサンプルファイルと質問を引数で渡して検証する:
 
@@ -21,6 +23,7 @@ import asyncio
 import sys
 from pathlib import Path
 
+from agent_framework import Content, Message
 from dotenv import load_dotenv
 
 # agent_def.py は親ディレクトリ（src/maf-foundry-agent/）にある。
@@ -43,15 +46,21 @@ async def _run(file_path: Path, questions: list[str]) -> None:
         file_id = uploaded.id
         print(f"uploaded: {file_path.name} -> file_id={file_id}")
 
-        # 2) 共有の create_agent() に file_ids を差し込んで組み立てる。
-        #    複数質問は同一セッションで会話履歴を引き継ぐ。
-        agent = create_agent(file_ids=[file_id], client=client)
-        session = agent.create_session()
+        # 2) 共有の create_agent() をそのまま組み立てる（file_ids は middleware が注入する）。
+        agent = create_agent(client=client)
 
-        # 3) 引数で渡された質問を順に実行して回答を表示する。
-        for question in questions:
+        # 3) 初回質問にファイルを hosted_file として添付し、以降は履歴＋新質問を毎回
+        #    まとめて messages で渡す（デプロイ時のホスティング層と同じ渡し方。
+        #    middleware が履歴中の hosted_file からも file_ids を拾えることを検証する）。
+        history: list[Message] = []
+        for i, question in enumerate(questions):
             print(f"\n=== Q: {question}")
-            response = await agent.run(question, session=session)
+            contents = [Content.from_text(question)]
+            if i == 0:
+                contents.insert(0, Content.from_hosted_file(file_id, name=file_path.name))
+            history.append(Message(role="user", contents=contents))
+            response = await agent.run(history)
+            history.extend(response.messages)
             print(response.text or str(response))
     finally:
         # イベントループ終了後のクローズ警告を防ぐため明示的に閉じる（close は async）。

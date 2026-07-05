@@ -1,44 +1,14 @@
-# デプロイ済みエージェントのファイル分析 — 調査ハンドオフ
+# デプロイ済みエージェントのファイル分析 — 実装まとめ
 
-> 作成: 2026-05-31 / 次のチャットで「修正」を行うための引き継ぎメモ。
-> 結論だけ読むなら **TL;DR** と **5. 決定すべき方針** を見れば足りる。
-
----
-
-## TL;DR
-
-- デプロイは成功。テキスト対話（「こんにちは」など）は正常に動く。
-- **`azd ai agent files upload` でアップロードしたファイルを、デプロイ済みエージェントの Code Interpreter (CI) が分析できない。**
-- 原因は**実機＋コードで確定済み**: `files upload` が書く先（Hosted Agent の**セッションFS**）と、CI が読む先（**auto コンテナの `/mnt/data`**）は**別のファイルシステム**。両者を繋ぐ実行時の経路が SDK に無い。
-- CI にファイルを入れる唯一の手段は **`get_code_interpreter_tool(file_ids=[...])` 構築時の `file_ids`**。今のコードは `file_ids=None` 固定なので CI は常に空。
-- **やり方が間違っていたわけではない。** `azd ai agent files` はヘルプ上 *"debugging, seeding data, and agent setup"* 用で、CI へのファイル投入路ではない。
-- 直すには下記 **3案のいずれか**（§5）。本命は **案B（リクエスト毎に file_ids を CI へ注入するコード改修）**。
+> **ステータス: ✅ 解決済み。** `azd ai agent files upload` でアップロードしたファイルを、
+> デプロイ済みエージェントの Code Interpreter (CI) が正しく分析できることを実機で確認済み
+> （実データに基づく正答がローカル検算と一致、マルチターンでも継続）。
 
 ---
 
-## 1. 現在のデプロイ構成（確認済み）
+## 1. 何が課題だったか
 
-| 項目 | 値 |
-|---|---|
-| リージョン | **japaneast** に統一 |
-| azd 環境 (`AZURE_ENV_NAME`) | `maf-foundry-agent-dev` |
-| リソースグループ | `rg-dev-ai`（japaneast） |
-| AI Foundry アカウント | `proj-dev-ai`（japaneast, kind=AIServices） |
-| プロジェクト | `proj-default` |
-| モデルデプロイ | `gpt-5.4`（version 2026-03-05, **GlobalStandard**） |
-| プロジェクト エンドポイント | `https://proj-dev-ai.services.ai.azure.com/api/projects/proj-default` |
-| Hosted Agent | `maf-foundry-agent`（remote, デプロイ済み・応答OK） |
-| `USE_EXISTING_AI_PROJECT` | `true`（既存 proj-dev-ai を採用） |
-
-**後片付け（未実施）**: 旧 `proj-dev-ai-eastus`（eastus）が同じ RG に残存。japaneast 動作確認が済んだら削除推奨。
-```bash
-az cognitiveservices account delete -n proj-dev-ai-eastus -g rg-dev-ai
-az cognitiveservices account purge  -n proj-dev-ai-eastus -g rg-dev-ai -l eastus
-```
-
----
-
-## 2. 症状（再現）
+### 症状
 
 ```
 $ azd ai agent files upload src/maf-foundry-agent/tests/sample_sales_data.csv
@@ -49,112 +19,140 @@ $ azd ai agent invoke "アップロードしたファイルの概要を教えて
 見つかりませんでした。…
 ```
 
----
+テキスト対話（「こんにちは」等）は正常に動くが、アップロードしたファイルを CI が認識しない。
 
-## 3. 確定した原因（実機 + コード両面で裏取り済み）
+### 原因
 
-### 3-1. 実機エビデンス
+`azd ai agent files upload` が書き込む先（Hosted Agent の **セッションFS**）と、CI が読む先
+（サンドボックスの **`/mnt/data`**）は別のファイルシステムで、両者をつなぐ経路は SDK に存在しない。
 
-**(a) ファイルはセッションFSに確かに存在**（`azd ai agent files list`）:
-```json
+実機で確認すると、セッションFSにはファイルがあるのに CI 内は空だった:
+
+```
+# files list ではファイルが見える
 { "name": "sample_sales_data.csv", "size": 161700, "is_dir": false }
-```
 
-**(b) しかし CI サンドボックスの `/mnt/data` は空**（診断 invoke で CI 内を列挙）:
-```
+# しかし CI サンドボックス内で確認すると空
 CWD= /home/sandbox
-LS_CWD= ['.bash_logout','.bashrc','.cache','.config','.ipython','.local','.openai_internal','.profile','uvicorn_logging.config']
 /mnt/data -> []          ← CI がファイルを置く標準マウント。空
-/mnt -> ['data']
-/home -> ['proxyuser','sandbox','vscode']
-/session ERR FileNotFoundError
-/workspace ERR FileNotFoundError
 ```
 
-**(c) セッションは一致している**（ずれが原因ではない）:
-`files list` のセッション = invoke のセッション = `def3298cbc7327113915340b684fc6ed364788aa2c7565f904eeaba21038a80`
+CI にファイルを渡す唯一の手段は、`get_code_interpreter_tool(file_ids=[...])` を**構築するときに
+渡す `file_ids`**。ところがデプロイ時のエントリポイント（`main.py` → `create_agent()`）はこの
+`file_ids` を渡す主体を持たず、常に空の CI ツールが使われていた
+（`agent_framework_foundry` の `get_code_interpreter_tool` は container を実質 `auto` 固定にし
+渡された `file_ids` を解決するだけで、セッションFSと CI サンドボックスを結びつける API はパッケージ内に無い）。
 
-> ⚠️ 注意: 診断時に `glob.glob("/**/*.csv", recursive=True)` を実行したら CI がルート全体を再帰探索して **600秒でタイムアウト**した。次回 CI 内を探索するときはルートからの再帰 glob を使わないこと。
+---
 
-### 3-2. コードエビデンス
+## 2. 解決策のアーキテクチャ
 
-- 入口は `file_ids` を渡していない:
-  - [src/maf-foundry-agent/agent_def.py:61](src/maf-foundry-agent/agent_def.py#L61) … `tools=FoundryChatClient.get_code_interpreter_tool(file_ids=file_ids)`
-  - `main.py` の `create_agent()` は `file_ids` 引数なし → **デプロイ時は `file_ids=None`**。
-- CI ツールは**常に auto コンテナ + file_ids のみ**で構成（セッションFSと無関係）:
-  - `agent_framework_foundry/_chat_client.py:343-363` `get_code_interpreter_tool`
-    ```python
-    resolved = resolve_file_ids(file_ids)
-    tool_container = AutoCodeInterpreterToolParam(file_ids=resolved)  # container は常に auto
-    return CodeInterpreterTool(container=tool_container, **kwargs)
-    ```
-- `resolve_file_ids`（同 `:97-119`）は**渡された file_ids を変換するだけ**。
-- `_prepare_tools_for_openai`（同 `:252-257`）はツールを整形するのみ。**受信メッセージ中のファイルを CI コンテナへ合流させるコードは無い。**
-- パッケージ内に **"Foundry Toolbox 経由 CI" に相当する API は無い**（`toolbox` は generic な `agent_framework/_tools.py` のみ。foundry プロバイダには無い）。CLAUDE.md §9 のその記述はポータル機能/別概念を指している可能性。
+[agent_def.py](src/maf-foundry-agent/agent_def.py) の `CodeInterpreterFileInjector`
+（`AgentMiddleware`）が、**run のたびに file_ids を集めて CI ツールを動的に組み立てて注入**する。
+Agent の既定 `tools` には CI を置かない（run-level tools と名前ベースでマージされるため、既定にも
+置くと二重登録になる）。
 
-### 3-3. まとめ（経路別の可否）
+file_ids の供給元は2つある:
 
-| 経路 | CI(`/mnt/data`) に届くか | 根拠 |
+| 供給元 | 経路 | 実運用で使うか |
 |---|---|---|
-| `azd ai agent files upload`（セッションFS） | ❌ | 実機で `/mnt/data` 空。別FS |
-| ローカル `tests/verify_local.py` | ✅ | `get_code_interpreter_tool(file_ids=[id])` で構築 |
-| デプロイ後にメッセージ添付（ポータル等） | ⚠️ 未検証 | SDK に自動合流コード無し。Agent Service 側が裏で繋ぐ可能性は残る |
+| ① `/responses` の `input_file`（file_id 付き） | ホスティング層が `hosted_file` Content に変換して `agent.run()` の messages に載せる | ローカル（ホストサーバ直POST）では動くが、**デプロイ後は Foundry ゲートウェイが `input_file` 付きリクエストをコンテナに届く前に 500 で落とす**ため実用不可 |
+| ② `azd ai agent files upload` のセッションFS | デプロイ時、コンテナ内の **`/home/session`** にマウントされる（`FOUNDRY_AGENT_SESSION_ID` で判定）。middleware が run 毎にそこを走査し、コンテナ内から Files API (`purpose="assistants"`) へアップロードして file_id 化する | **こちらが実際に使われる経路** |
+
+```python
+class CodeInterpreterFileInjector(AgentMiddleware):
+    async def process(self, context: AgentContext, call_next):
+        # ① messages 中の hosted_file Content から file_id を収集
+        # ② セッションFS (/home/session) 配下のファイルを Files API へアップロードして file_id 化
+        # → 両方を合わせて run-level の CI ツールを組み立てる
+        ...
+        context.tools = [FoundryChatClient.get_code_interpreter_tool(file_ids=list(file_ids) or None)]
+        await call_next()
+```
+
+### 実装上の注意点
+
+- middleware の context 型は `AgentContext`。シグネチャは `process(self, context, call_next)` で
+  `call_next()` は引数なし。`context.tools` の書き換えは有効。
+- `hosted_file` Content をそのままモデル入力に残すと `input_file` として送信され、
+  PDF 以外は 400 (unsupported_file) になる。file_id 抽出後、テキストの目印
+  `[添付ファイル: <name> — Code Interpreter の /mnt/data から読み込めます]` に置き換える
+  （元 Message は履歴で再利用されるため破壊せず、新しい Message を作る）。
+- マルチターン: ホスティング層は毎ターン「履歴 + 今回入力」を全部 messages で渡すため、
+  過去ターンの添付も middleware から見える。過去ターンの file_id が消える心配は不要。
+- セッションFS からのアップロードは `(session, path, size, mtime)` をキーに再利用し、
+  同じファイルを毎ターン再アップロードしない。
 
 ---
 
-## 4. なぜローカルは動いてデプロイは動かないのか（CLAUDE.md §9 の落とし穴そのもの）
+## 3. 検証方法
 
-- ローカル検証は Files API に `purpose="assistants"` でアップ → `file_id` を得 → `get_code_interpreter_tool(file_ids=[id])` で構築。だから `/mnt/data` にファイルが入る。
-  ```python
-  openai_client = client.project_client.get_openai_client()
-  uploaded = await openai_client.files.create(file=f, purpose="assistants")
-  # → uploaded.id を file_ids に渡す
-  ```
-- デプロイ後はこの `file_ids` を渡す主体がいない（入口が `None` 固定、実行時注入も無い）。
+### ローカル
 
----
-
-## 5. 決定すべき方針（次チャットで選ぶ）
-
-### 案A: まず Foundry ポータルのチャット添付を検証（コード変更ゼロ）
-- ポータルの playground/チャットで CSV を**メッセージ添付**して質問。
-- Agent Service が「メッセージ添付ファイル → CI の auto コンテナ」を裏で繋いでいれば、それで完了。
-- 長所: タダで可否が分かる。`files upload`（seed/debug 用）とは別経路。
-- 短所: SDK 側に合流コードが無いため、繋がらない可能性も十分ある（未検証）。
-
-### 案B（本命）: リクエスト毎に `file_ids` を CI へ注入するコード改修
-- エージェントを「**受信リクエストから file_id を取り出し、その都度 `get_code_interpreter_tool(file_ids=[...])` で CI ツールを組み立てる**」形に変える。
-- 確実に動く本番経路。`agent_def.py` の静的ツール構築（[:61](src/maf-foundry-agent/agent_def.py#L61)）を、middleware か run ループでの動的構築に置き換える。
-- **次チャットで先に確認すべき未解決点（§6）あり。**
-- 長所: 確実。短所: コード追加が要る（CLAUDE.md §0「まずシンプル」とのバランス要検討）。
-
-### 案C: 当面ローカルのみ運用、デプロイ後分析は後回し
-- `verify_local.py` は file_ids で既に動く。デプロイ版は「こんにちは」系の対話エージェントとして完成扱い。
-- ファイル分析が今すぐ要らないなら最小コストで一旦クローズ。
-
----
-
-## 6. 案Bを選ぶ場合に、次チャットで最初に確認すべき未解決点
-
-1. **ResponsesHostServer は、受信リクエストの添付ファイルをエージェントの run にどう渡すか？**
-   - 受信メッセージに `HostedFileContent`（`Content.from_hosted_file(file_id=...)`）として現れるか、あるいは別形式か。
-   - 現れるなら、middleware でそれを抽出 → `file_ids` を作って CI ツールを再構築できる。
-2. **動的にツールを差し替える最小の仕掛け**は何か（middleware か、リクエスト毎に `Agent` を組み直すか）。
-3. **file_id の発生源**: クライアント/ポータルが Files API に上げて file_id を渡すのか、エージェント自身が受け取った生バイトを Files API に上げる必要があるのか。
-4. （調査用）CI を**セッション結合コンテナ**に束ねる手段が SDK に無いか再確認（現状 `get_code_interpreter_tool` は `container` を実質 auto に固定している点を踏まえる）。
-
----
-
-## 7. 参考: よく使ったコマンド
+[tests/verify_local.py](src/maf-foundry-agent/tests/verify_local.py) が本番と同じ経路
+（Files API アップロード → `create_agent()` → `Content.from_hosted_file(file_id)` をメッセージに
+添付 → middleware が file_ids を注入）を再現する:
 
 ```bash
-# セッションFSの中身（直近 invoke セッション基準）
+cd src/maf-foundry-agent
+python tests/verify_local.py <file.xlsx> "質問1" ["質問2" ...]
+```
+
+### デプロイ後 E2E
+
+```bash
+azd ai agent files upload <file>
+azd ai agent invoke "アップロードしたファイルの合計を教えて"
+```
+
+応答に `code_interpreter_tool_call` と実データに基づく分析結果（ローカル検算と一致）が
+含まれることを確認する。
+
+---
+
+## 4. 運用上の注意点
+
+- **デプロイ直後の一時障害**: コンテナ内マネージド ID が `No token received` で全リクエスト
+  500 になることがある（プラットフォーム側の一時障害）。再デプロイで直る。
+- **後片付け（未実施）**: 旧 `proj-dev-ai-eastus`（eastus）が同じリソースグループに残存している。
+  japaneast での動作確認が済んでいるため削除してよい:
+  ```bash
+  az cognitiveservices account delete -n proj-dev-ai-eastus -g rg-dev-ai
+  az cognitiveservices account purge  -n proj-dev-ai-eastus -g rg-dev-ai -l eastus
+  ```
+
+---
+
+## 5. 現在のデプロイ構成
+
+| 項目 | 値 |
+|---|---|
+| リージョン | japaneast に統一 |
+| azd 環境 (`AZURE_ENV_NAME`) | `maf-foundry-agent-dev` |
+| リソースグループ | `rg-dev-ai`（japaneast） |
+| AI Foundry アカウント | `proj-dev-ai`（japaneast, kind=AIServices） |
+| プロジェクト | `proj-default` |
+| モデルデプロイ | `gpt-5.4`（version 2026-03-05, GlobalStandard） |
+| プロジェクト エンドポイント | `https://proj-dev-ai.services.ai.azure.com/api/projects/proj-default` |
+| Hosted Agent | `maf-foundry-agent`（remote, デプロイ済み・応答OK） |
+| `USE_EXISTING_AI_PROJECT` | `true`（既存 `proj-dev-ai` を採用） |
+| SDK バージョン | `agent-framework` / `agent-framework-foundry` 1.7.0、`agent-framework-foundry-hosting` 1.0.0a260528 |
+
+---
+
+## 6. 参考コマンド
+
+```bash
+# セッションFSの中身（直近 invoke セッション基準）※ CI とは別FS
 azd ai agent files list
 
 # デプロイ済みエージェントへ送信（セッションは連続 invoke で自動継続。--new-session でリセット）
 azd ai agent invoke "メッセージ"
 
-# CI サンドボックス内を覗く診断（ルート再帰 glob は厳禁＝タイムアウト）
+# リクエストボディを JSON で直接送る（input_file + file_id の E2E に使う）
+azd ai agent invoke -f request.json
+
+# CI サンドボックス内を覗く診断（ルート再帰 glob は厳禁＝タイムアウト。実際に600秒で発生した）
 azd ai agent invoke 'Code Interpreterで実行: import os; print(os.getcwd(), os.listdir("/mnt/data"))'
 
 # 状態確認
@@ -162,7 +160,13 @@ azd ai agent show maf-foundry-agent
 azd ai agent monitor --follow
 ```
 
-## 8. 参考リンク（CLAUDE.md より）
+---
+
+## 7. 参考リンク
+
 - MAF docs: 「Microsoft Foundry provider」「Code Interpreter」「Hosted agents in Foundry Agent Service」
-- MAF samples: `python/samples/02-agents/providers/foundry/`（file_ids 付き CI の実例）、
-  `python/samples/04-hosting/foundry-hosted-agents/responses/`
+- MAF samples (github.com/microsoft/agent-framework):
+  - `python/samples/02-agents/providers/foundry/`（file_ids 付き CI の実例）
+  - `python/samples/04-hosting/foundry-hosted-agents/responses/`（ResponsesHostServer + Dockerfile + agent.yaml）
+  - `python/samples/03-workflows/orchestrations/handoff_with_code_interpreter_file.py`
+    （CI が生成したファイルを hosted_file Content として取り回す実例）

@@ -12,7 +12,8 @@ load_dotenv()
 
 
 def main() -> None:
-    # file_ids なし＝デプロイ用。ファイルは Hosted Agent セッション経由で届く。
+    # ファイルは /responses の input_file(file_id) → hosted_file Content として届き、
+    # agent_def.py の middleware が run 毎に Code Interpreter へ注入する。
     ResponsesHostServer(create_agent()).run()
 
 
